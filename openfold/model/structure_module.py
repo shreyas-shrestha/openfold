@@ -44,7 +44,11 @@ from openfold.utils.tensor_utils import (
     flatten_final_dims,
 )
 
-attn_core_inplace_cuda = importlib.import_module("attn_core_inplace_cuda")
+# Try to import the CUDA kernel, but don't crash if it's not available
+try:
+    attn_core_inplace_cuda = importlib.import_module("attn_core_inplace_cuda")
+except ModuleNotFoundError:
+    attn_core_inplace_cuda = None
 
 
 class AngleResnetBlock(nn.Module):
@@ -179,8 +183,8 @@ class PointProjection(nn.Module):
         precision = torch.float32 if self.is_multimer else None
         self.linear = Linear(c_hidden, no_heads * 3 * num_points, precision=precision)
 
-    def forward(self, 
-        activations: torch.Tensor, 
+    def forward(self,
+        activations: torch.Tensor,
         rigids: Union[Rigid, Rigid3Array],
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         # TODO: Needs to run in high precision during training
@@ -432,7 +436,8 @@ class InvariantPointAttention(nn.Module):
         # [*, H, N_res, N_res]
         pt_att = permute_final_dims(pt_att, (2, 0, 1))
 
-        if (inplace_safe):
+        # Check if the CUDA kernel is available and we're on a CUDA device
+        if (attn_core_inplace_cuda is not None and a.device.type == 'cuda' and inplace_safe):
             a += pt_att
             del pt_att
             a += square_mask.unsqueeze(-3)
@@ -469,8 +474,8 @@ class InvariantPointAttention(nn.Module):
         else:
             o_pt = torch.sum(
                 (
-                        a[..., None, :, :, None]
-                        * permute_final_dims(v_pts, (1, 3, 0, 2))[..., None, :, :]
+                    a[..., None, :, :, None]
+                    * permute_final_dims(v_pts, (1, 3, 0, 2))[..., None, :, :]
                 ),
                 dim=-2,
             )
@@ -699,9 +704,9 @@ class InvariantPointAttentionMultimer(nn.Module):
         o_pt = v_pts[..., None, :, :, :] * a.unsqueeze(-1)
         o_pt = o_pt.sum(dim=-3)
         # o_pt = Vec3Array(
-        #     torch.sum(a.unsqueeze(-1) * v_pts[..., None, :, :, :].x, dim=-3),
-        #     torch.sum(a.unsqueeze(-1) * v_pts[..., None, :, :, :].y, dim=-3),
-        #     torch.sum(a.unsqueeze(-1) * v_pts[..., None, :, :, :].z, dim=-3),
+        #      torch.sum(a.unsqueeze(-1) * v_pts[..., None, :, :, :].x, dim=-3),
+        #      torch.sum(a.unsqueeze(-1) * v_pts[..., None, :, :, :].y, dim=-3),
+        #      torch.sum(a.unsqueeze(-1) * v_pts[..., None, :, :, :].z, dim=-3),
         # )
 
         # [*, N_res, H * P_v, 3]
@@ -755,12 +760,12 @@ class BackboneUpdate(nn.Module):
         Args:
             [*, N_res, C_s] single representation
         Returns:
-            [*, N_res, 6] update vector 
+            [*, N_res, 6] update vector
         """
         # [*, 6]
         update = self.linear(s)
 
-        return update 
+        return update
 
 
 class StructureModuleTransitionLayer(nn.Module):
@@ -982,9 +987,9 @@ class StructureModule(nn.Module):
 
         # [*, N]
         rigids = Rigid.identity(
-            s.shape[:-1], 
-            s.dtype, 
-            s.device, 
+            s.shape[:-1],
+            s.dtype,
+            s.device,
             self.training,
             fmt="quat",
         )
@@ -992,18 +997,18 @@ class StructureModule(nn.Module):
         for i in range(self.no_blocks):
             # [*, N, C_s]
             s = s + self.ipa(
-                s, 
-                z, 
-                rigids, 
-                mask, 
+                s,
+                z,
+                rigids,
+                mask,
                 inplace_safe=inplace_safe,
-                _offload_inference=_offload_inference, 
+                _offload_inference=_offload_inference,
                 _z_reference_list=z_reference_list
             )
             s = self.ipa_dropout(s)
             s = self.layer_norm_ipa(s)
             s = self.transition(s)
-           
+            
             # [*, N]
             rigids = rigids.compose_q_update_vec(self.bb_update(s))
 
@@ -1012,7 +1017,7 @@ class StructureModule(nn.Module):
             # here
             backb_to_global = Rigid(
                 Rotation(
-                    rot_mats=rigids.get_rots().get_rot_mats(), 
+                    rot_mats=rigids.get_rots().get_rot_mats(),
                     quats=None
                 ),
                 rigids.get_trans(),
@@ -1096,8 +1101,8 @@ class StructureModule(nn.Module):
 
         # [*, N]
         rigids = Rigid3Array.identity(
-            s.shape[:-1], 
-            s.device, 
+            s.shape[:-1],
+            s.device,
         )
         outputs = []
         for i in range(self.no_blocks):
