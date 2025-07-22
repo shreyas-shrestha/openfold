@@ -16,7 +16,9 @@ from functools import reduce
 from operator import mul
 
 import torch
+import torch.nn.functional as F
 
+# Try to import the CUDA kernel
 try:
     attn_core_inplace_cuda = importlib.import_module("attn_core_inplace_cuda")
 except ModuleNotFoundError:
@@ -36,10 +38,11 @@ class AttentionCoreFunction(torch.autograd.Function):
 
         q = q.contiguous()
         k = k.contiguous()
+        v = v.contiguous()
 
-        # [*, H, Q, K] 
+        # [*, H, Q, K]
         attention_logits = torch.matmul(
-            q, k.transpose(-1, -2), 
+            q, k.transpose(-1, -2),
         )
 
         if(bias_1 is not None):
@@ -47,59 +50,72 @@ class AttentionCoreFunction(torch.autograd.Function):
         if(bias_2 is not None):
             attention_logits += bias_2
 
-        attn_core_inplace_cuda.forward_(
-            attention_logits, 
-            reduce(mul, attention_logits.shape[:-1]),
-            attention_logits.shape[-1],
-        )
+        # Check if our CUDA kernel exists. If so, use it.
+        if attn_core_inplace_cuda is not None and q.device.type == "cuda":
+            attn_core_inplace_cuda.forward_(
+                attention_logits,
+                reduce(mul, attention_logits.shape[:-1]),
+                attention_logits.shape[-1],
+            )
+            # The attention_logits are modified in-place by the kernel
+            attn_weights = attention_logits
+        else:
+            # Otherwise, use the standard PyTorch softmax.
+            attn_weights = F.softmax(attention_logits, dim=-1)
 
-        o = torch.matmul(attention_logits, v) 
+        o = torch.matmul(attn_weights, v)
 
-        ctx.bias_1_shape = bias_1.shape if bias_1 is not None else None
-        ctx.bias_2_shape = bias_2.shape if bias_2 is not None else None
-        ctx.save_for_backward(q, k, v, attention_logits)
+        ctx.save_for_backward(q, k, v, attn_weights, bias_1, bias_2)
 
         return o
 
     @staticmethod
     def backward(ctx, grad_output):
-        q, k, v, attention_logits = ctx.saved_tensors
+        q, k, v, attn_weights, bias_1, bias_2 = ctx.saved_tensors
         grad_q = grad_k = grad_v = grad_bias_1 = grad_bias_2 = None
-       
-        grad_v = torch.matmul(
-            attention_logits.transpose(-1, -2), 
-            grad_output
-        )
 
-        attn_core_inplace_cuda.backward_(
-            attention_logits,
-            grad_output.contiguous(),
-            v.contiguous(), # v is implicitly transposed in the kernel
-            reduce(mul, attention_logits.shape[:-1]),
-            attention_logits.shape[-1],
-            grad_output.shape[-1],
-        )
+        # Check if our CUDA kernel exists. If so, use its backward pass.
+        if attn_core_inplace_cuda is not None and q.device.type == "cuda":
+            # The custom kernel needs some specific shapes and inputs
+            # The attn_weights tensor is modified in-place to become the gradient
+            attn_core_inplace_cuda.backward_(
+                attn_weights,
+                grad_output.contiguous(),
+                v.contiguous(),
+                reduce(mul, attn_weights.shape[:-1]),
+                attn_weights.shape[-1],
+                grad_output.shape[-1],
+            )
+            grad_attn_logits = attn_weights # The tensor is now the gradient
+        else:
+            # Otherwise, let PyTorch's autograd handle it
+            # This is the standard backward pass for the attention mechanism
+            grad_attn_weights = torch.matmul(grad_output, v.transpose(-1, -2))
+            
+            # Backward pass for softmax
+            sum_grad = torch.sum(grad_attn_weights * attn_weights, dim=-1, keepdim=True)
+            grad_attn_logits = attn_weights * (grad_attn_weights - sum_grad)
 
-        if(ctx.bias_1_shape is not None):
+
+        # Gradients for q, k, v
+        grad_q = torch.matmul(grad_attn_logits, k)
+        grad_k = torch.matmul(grad_attn_logits.transpose(-1, -2), q).transpose(-1, -2)
+        grad_v = torch.matmul(attn_weights.transpose(-1, -2), grad_output)
+        
+        # Gradients for biases
+        if bias_1 is not None:
             grad_bias_1 = torch.sum(
-                attention_logits,
-                dim=tuple(i for i,d in enumerate(ctx.bias_1_shape) if d == 1),
+                grad_attn_logits,
+                dim=tuple(i for i, d in enumerate(bias_1.shape) if d == 1),
                 keepdim=True,
             )
 
-        if(ctx.bias_2_shape is not None):
+        if bias_2 is not None:
             grad_bias_2 = torch.sum(
-                attention_logits,
-                dim=tuple(i for i,d in enumerate(ctx.bias_2_shape) if d == 1),
+                grad_attn_logits,
+                dim=tuple(i for i, d in enumerate(bias_2.shape) if d == 1),
                 keepdim=True,
             )
-
-        grad_q = torch.matmul(
-            attention_logits, k
-        )
-        grad_k = torch.matmul(
-            q.transpose(-1, -2), attention_logits,
-        ).transpose(-1, -2)
 
         return grad_q, grad_k, grad_v, grad_bias_1, grad_bias_2
 
